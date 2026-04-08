@@ -151,6 +151,27 @@ abstract class Channel {
     consumer.commitSync(offsetsToCommit);
   }
 
+  protected void commitSourceOffsets(Map<TopicPartition, Offset> sourceOffsets) {
+    Map<TopicPartition, OffsetAndMetadata> offsetsToCommit = Maps.newHashMap();
+    sourceOffsets.forEach((k, v) -> offsetsToCommit.put(k, new OffsetAndMetadata(v.offset())));
+
+    synchronized (producer) {
+      producer.beginTransaction();
+      try {
+        producer.sendOffsetsToTransaction(
+            offsetsToCommit, KafkaUtils.consumerGroupMetadata(context));
+        producer.commitTransaction();
+      } catch (Exception e) {
+        try {
+          producer.abortTransaction();
+        } catch (Exception ex) {
+          LOG.warn("Error aborting source offset commit transaction", ex);
+        }
+        throw e;
+      }
+    }
+  }
+
   void start() {
     consumer.subscribe(ImmutableList.of(controlTopic));
 

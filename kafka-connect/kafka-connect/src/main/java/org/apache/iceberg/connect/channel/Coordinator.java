@@ -82,6 +82,9 @@ class Coordinator extends Channel {
   private final CommitState commitState;
   private volatile boolean terminated;
   private final String taskId;
+  private int consecutiveCommitFailures = 0;
+
+  private static final int MAX_CONSECUTIVE_COMMIT_FAILURES = 3;
 
   Coordinator(
       Catalog catalog,
@@ -150,12 +153,20 @@ class Coordinator extends Channel {
   private void commit(boolean partialCommit) {
     try {
       doCommit(partialCommit);
+      consecutiveCommitFailures = 0;
     } catch (Exception e) {
+      consecutiveCommitFailures++;
       LOG.warn(
-          "Coordinator {} failed to commit for commit {}, will try again next cycle",
+          "Coordinator {} failed to commit for commit {} (attempt {}/{}), will try again next cycle",
           taskId,
           commitState.currentCommitId(),
+          consecutiveCommitFailures,
+          MAX_CONSECUTIVE_COMMIT_FAILURES,
           e);
+      if (consecutiveCommitFailures >= MAX_CONSECUTIVE_COMMIT_FAILURES) {
+        throw new ConnectException(
+            "Too many consecutive commit failures (" + consecutiveCommitFailures + ")", e);
+      }
     } finally {
       commitState.endCurrentCommit();
     }

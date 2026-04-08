@@ -21,6 +21,7 @@ package org.apache.iceberg.connect.channel;
 import java.time.Duration;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.stream.Collectors;
 import org.apache.iceberg.connect.IcebergSinkConfig;
@@ -33,14 +34,21 @@ import org.apache.iceberg.connect.events.Event;
 import org.apache.iceberg.connect.events.PayloadType;
 import org.apache.iceberg.connect.events.StartCommit;
 import org.apache.iceberg.connect.events.TopicPartitionOffset;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTaskContext;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 class Worker extends Channel {
+
+  private static final Logger LOG = LoggerFactory.getLogger(Worker.class);
 
   private final IcebergSinkConfig config;
   private final SinkTaskContext context;
   private final SinkWriter sinkWriter;
+  private Map<TopicPartition, Offset> pendingSourceOffsets = ImmutableMap.of();
 
   Worker(
       IcebergSinkConfig config,
@@ -67,6 +75,12 @@ class Worker extends Channel {
   @Override
   protected boolean receive(Envelope envelope) {
     Event event = envelope.event();
+
+    if (event.payload().type() == PayloadType.COMMIT_COMPLETE) {
+      commitPendingSourceOffsets();
+      return true;
+    }
+
     if (event.payload().type() != PayloadType.START_COMMIT) {
       return false;
     }
@@ -108,9 +122,23 @@ class Worker extends Channel {
     Event readyEvent = new Event(config.connectGroupId(), new DataComplete(commitId, assignments));
     events.add(readyEvent);
 
-    send(events, results.sourceOffsets());
+    // Store source offsets for deferred commit — only commit after successful Iceberg commit.
+    // Send control events WITHOUT source offsets to avoid advancing consumer position
+    // before Iceberg commit succeeds.
+    pendingSourceOffsets = results.sourceOffsets();
+    send(events, ImmutableMap.of());
 
     return true;
+  }
+
+  private void commitPendingSourceOffsets() {
+    if (!pendingSourceOffsets.isEmpty()) {
+      commitSourceOffsets(pendingSourceOffsets);
+      LOG.info(
+          "Committed source offsets for {} partitions after successful Iceberg commit",
+          pendingSourceOffsets.size());
+      pendingSourceOffsets = ImmutableMap.of();
+    }
   }
 
   @Override
