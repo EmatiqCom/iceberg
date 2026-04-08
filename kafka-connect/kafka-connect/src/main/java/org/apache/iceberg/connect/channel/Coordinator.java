@@ -76,6 +76,9 @@ class Coordinator extends Channel {
   private final String snapshotOffsetsProp;
   private final ExecutorService exec;
   private final CommitState commitState;
+  private int consecutiveCommitFailures = 0;
+
+  private static final int MAX_CONSECUTIVE_COMMIT_FAILURES = 3;
 
   Coordinator(
       Catalog catalog,
@@ -143,8 +146,18 @@ class Coordinator extends Channel {
   private void commit(boolean partialCommit) {
     try {
       doCommit(partialCommit);
+      consecutiveCommitFailures = 0;
     } catch (Exception e) {
-      LOG.warn("Commit failed, will try again next cycle", e);
+      consecutiveCommitFailures++;
+      LOG.warn(
+          "Commit failed (attempt {}/{}), will try again next cycle",
+          consecutiveCommitFailures,
+          MAX_CONSECUTIVE_COMMIT_FAILURES,
+          e);
+      if (consecutiveCommitFailures >= MAX_CONSECUTIVE_COMMIT_FAILURES) {
+        throw new ConnectException(
+            "Too many consecutive commit failures (" + consecutiveCommitFailures + ")", e);
+      }
     } finally {
       commitState.endCurrentCommit();
     }
