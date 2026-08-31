@@ -228,6 +228,60 @@ public class TestPrestoViews {
     assertThat(PrestoViews.hasProjectionStar("WITH x AS (SELECT 1) (SELECT * FROM x)")).isTrue();
   }
 
+  @Test
+  public void testCatalogIsStrippedInsideTrinosParenthesisedJoinTree() {
+    // Shape taken verbatim from hd_mapper.source_selection: Trino writes FROM, a newline, then
+    // opens parens around the whole join tree before the first relation.
+    assertThat(
+            PrestoViews.toEngineIdentifiers(
+                "SELECT a\nFROM\n  ((\"awsdatacatalog\".\"db\".\"t\" ss\n"
+                    + "LEFT JOIN \"awsdatacatalog\".\"db\".\"u\" rs ON (ss.id = rs.id)))",
+                CATALOG))
+        .isEqualTo("SELECT a\nFROM\n  ((`db`.`t` ss\nLEFT JOIN `db`.`u` rs ON (ss.id = rs.id)))");
+  }
+
+  @Test
+  public void testParensDoNotMakeAProjectionLookLikeARelation() {
+    // Skipping '(' must not reach past the SELECT that separates the two.
+    assertThat(
+            PrestoViews.toEngineIdentifiers(
+                "SELECT a FROM (SELECT \"awsdatacatalog\".\"payload\".\"id\" FROM \"t\") x",
+                CATALOG))
+        .isEqualTo("SELECT a FROM (SELECT `awsdatacatalog`.`payload`.`id` FROM `t`) x");
+  }
+
+  @Test
+  public void testThreePartChainOutsideARelationKeepsItsQualifier() {
+    // An alias called awsdatacatalog dereferencing a nested row field is also a three-part chain.
+    // Stripping it would leave `payload`.`id`, which in a join can resolve somewhere else entirely.
+    assertThat(
+            PrestoViews.toEngineIdentifiers(
+                "SELECT \"awsdatacatalog\".\"payload\".\"id\" FROM \"t\" \"awsdatacatalog\"",
+                CATALOG))
+        .isEqualTo("SELECT `awsdatacatalog`.`payload`.`id` FROM `t` `awsdatacatalog`");
+  }
+
+  @Test
+  public void testCatalogIsStrippedAfterFromAndJoin() {
+    assertThat(
+            PrestoViews.toEngineIdentifiers(
+                "SELECT a FROM \"awsdatacatalog\".\"db\".\"t\"", CATALOG))
+        .isEqualTo("SELECT a FROM `db`.`t`");
+
+    assertThat(
+            PrestoViews.toEngineIdentifiers(
+                "SELECT a FROM \"awsdatacatalog\".\"db\".\"t\" x "
+                    + "LEFT JOIN \"awsdatacatalog\".\"db\".\"u\" y ON (x.id = y.id)",
+                CATALOG))
+        .isEqualTo("SELECT a FROM `db`.`t` x LEFT JOIN `db`.`u` y ON (x.id = y.id)");
+
+    // Trino writes the relation on its own line - the keyword check has to see past the newline.
+    assertThat(
+            PrestoViews.toEngineIdentifiers(
+                "SELECT a\nFROM\n  \"awsdatacatalog\".\"db\".\"t\"", CATALOG))
+        .isEqualTo("SELECT a\nFROM\n  `db`.`t`");
+  }
+
   private static Column column(String name, String type) {
     return Column.builder().name(name).type(type).build();
   }

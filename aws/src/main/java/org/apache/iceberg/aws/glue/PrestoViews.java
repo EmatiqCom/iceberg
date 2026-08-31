@@ -64,6 +64,7 @@ class PrestoViews {
   private static final String VIEW_TEXT_PREFIX = "/* Presto View: ";
   private static final String VIEW_TEXT_SUFFIX = " */";
   private static final String DIALECT = "trino";
+  private static final String[] RELATION_KEYWORDS = {"from", "join"};
 
   /** Not a dependency on iceberg-spark: the property name is part of the view format. */
   private static final class SparkViewProperties {
@@ -304,17 +305,23 @@ class PrestoViews {
         out.append(sql, i, nonCode);
         i = nonCode;
       } else if (c == '"') {
+        int identifierStart = i;
         StringBuilder identifier = new StringBuilder();
         i = readQuotedIdentifier(sql, i, identifier);
         String name = identifier.toString();
 
-        // Skip "catalog". - keep the database and table, which the engine can resolve. Only in the
-        // three-part shape Trino writes for a relation: an alias or field that happens to carry the
-        // catalog's name is two-part, and dropping its qualifier would resolve something else.
+        // Skip "catalog". - keep the database and table, which the engine can resolve. Two
+        // conditions, because the catalog's name carries no privilege of its own: an alias or a row
+        // field may legitimately be called awsdatacatalog, and dropping ITS qualifier resolves
+        // something else. So the chain must be the three-part shape Trino writes for a relation
+        // AND stand where Trino writes relations, immediately after FROM or JOIN. A three-part
+        // chain elsewhere - `"awsdatacatalog"."payload"."id"`, an alias dereferencing a nested
+        // field - keeps its qualifier and the engine decides.
         if (name.equals(catalog)
             && i < sql.length()
             && sql.charAt(i) == '.'
-            && qualifiesRelation(sql, i)) {
+            && qualifiesRelation(sql, i)
+            && followsRelationKeyword(sql, identifierStart)) {
           i++;
           continue;
         }
@@ -421,6 +428,40 @@ class PrestoViews {
       }
 
       i++;
+    }
+
+    return false;
+  }
+
+  /**
+   * True when the token immediately before {@code start}, ignoring whitespace, is FROM or JOIN.
+   *
+   * <p>This is what keeps the catalog qualifier from being stripped off an expression. It is a
+   * token check rather than a parse, so a relation Trino writes in some other position keeps its
+   * qualifier - which reaches the engine as a catalog it has no name for, a loud error rather than
+   * a silently different column. A comment sitting between the keyword and the relation has the
+   * same effect.
+   */
+  private static boolean followsRelationKeyword(String sql, int start) {
+    // Whitespace and '(' only. Trino parenthesises its join trees, so a relation is routinely
+    // written as `FROM\n  (("db"."t" a LEFT JOIN "db"."u" b ON ...))` - skipping the parens is what
+    // makes those relations reachable. Nothing else is skipped: a SELECT, a comma or an operator
+    // between the keyword and the chain stops the walk, so a chain in a projection is never taken
+    // for a relation.
+    int i = start - 1;
+    while (i >= 0 && (Character.isWhitespace(sql.charAt(i)) || sql.charAt(i) == '(')) {
+      i--;
+    }
+
+    if (i < 0) {
+      return false;
+    }
+
+    for (String keyword : RELATION_KEYWORDS) {
+      int begin = i - keyword.length() + 1;
+      if (begin >= 0 && keywordAt(sql, begin, keyword)) {
+        return true;
+      }
     }
 
     return false;
