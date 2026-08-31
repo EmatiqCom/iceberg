@@ -565,6 +565,15 @@ public class GlueCatalog extends BaseMetastoreViewCatalog
       Table glueTable = response.table();
 
       if (!isGlueIcebergView(glueTable)) {
+        // listViews and viewExists report Presto/Athena views, so a drop can legitimately land on
+        // one. Returning false would read as "there was no such view" and hide why nothing
+        // happened.
+        ValidationException.check(
+            !PrestoViews.isPrestoView(glueTable),
+            "Cannot drop view %s: it is a Presto/Athena view, which Iceberg only reads. Drop it in "
+                + "the engine that owns it.",
+            identifier);
+
         LOG.warn("dropView({}) called but Glue table is not an iceberg-view", identifier);
         return false;
       }
