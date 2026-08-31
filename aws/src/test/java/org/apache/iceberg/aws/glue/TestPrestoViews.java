@@ -27,9 +27,11 @@ import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.types.Types;
 import org.junit.jupiter.api.Test;
 import software.amazon.awssdk.services.glue.model.Column;
+import software.amazon.awssdk.services.glue.model.Table;
 
 public class TestPrestoViews {
 
@@ -173,6 +175,57 @@ public class TestPrestoViews {
     // A star in a literal or a comment is not a projection.
     assertThat(PrestoViews.hasProjectionStar("SELECT a FROM \"t\" WHERE b = '*'")).isFalse();
     assertThat(PrestoViews.hasProjectionStar("SELECT a -- keep *\nFROM \"t\"")).isFalse();
+  }
+
+  @Test
+  public void testIcebergViewIsNeverTreatedAsPrestoView() {
+    // An Iceberg view's properties reach the Glue parameters, so presto_view can ride along.
+    Table both =
+        Table.builder()
+            .name("v")
+            .tableType("VIRTUAL_VIEW")
+            .parameters(ImmutableMap.of("table_type", "iceberg-view", "presto_view", "true"))
+            .build();
+    assertThat(PrestoViews.isPrestoView(both)).isFalse();
+
+    Table presto =
+        Table.builder()
+            .name("v")
+            .tableType("VIRTUAL_VIEW")
+            .parameters(ImmutableMap.of("presto_view", "true"))
+            .build();
+    assertThat(PrestoViews.isPrestoView(presto)).isTrue();
+  }
+
+  @Test
+  public void testCatalogNameIsKeptWhenItIsNotARelationQualifier() {
+    // Two-part: an alias or field that happens to carry the catalog's name. Dropping the qualifier
+    // would resolve something else, so it stays and the engine decides.
+    assertThat(
+            PrestoViews.toEngineIdentifiers(
+                "SELECT \"awsdatacatalog\".\"x\" FROM \"t\" \"awsdatacatalog\"", CATALOG))
+        .isEqualTo("SELECT `awsdatacatalog`.`x` FROM `t` `awsdatacatalog`");
+
+    // Three-part: the shape Trino writes for a relation, so the catalog goes.
+    assertThat(
+            PrestoViews.toEngineIdentifiers(
+                "SELECT a FROM \"awsdatacatalog\".\"db\".\"t\"", CATALOG))
+        .isEqualTo("SELECT a FROM `db`.`t`");
+  }
+
+  @Test
+  public void testParenthesisedRootQueryDoesNotBypassTheStarCheck() {
+    assertThat(PrestoViews.hasProjectionStar("(SELECT * FROM \"t\")")).isTrue();
+    assertThat(PrestoViews.hasProjectionStar("  ((SELECT * FROM \"t\"))  ")).isTrue();
+    // Unwrapping must not turn an explicit projection into a refusal.
+    assertThat(PrestoViews.hasProjectionStar("(SELECT a FROM \"t\")")).isFalse();
+  }
+
+  @Test
+  public void testUnlocatableProjectionIsRefused() {
+    // The root query is nested in a shape the walk cannot unwrap, so it never sees a depth-zero
+    // SELECT list. Refusing beats serving a possible star off a possibly stale schema.
+    assertThat(PrestoViews.hasProjectionStar("WITH x AS (SELECT 1) (SELECT * FROM x)")).isTrue();
   }
 
   private static Column column(String name, String type) {

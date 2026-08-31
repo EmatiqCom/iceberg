@@ -25,6 +25,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
+import org.apache.iceberg.BaseMetastoreTableOperations;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.ValidationException;
@@ -74,10 +75,21 @@ class PrestoViews {
   private PrestoViews() {}
 
   static boolean isPrestoView(Table glueTable) {
-    return glueTable != null
-        && GlueCatalog.GLUE_VIRTUAL_VIEW_TYPE.equalsIgnoreCase(glueTable.tableType())
-        && glueTable.parameters() != null
-        && "true".equalsIgnoreCase(glueTable.parameters().get(PRESTO_VIEW_PARAM));
+    if (glueTable == null
+        || !GlueCatalog.GLUE_VIRTUAL_VIEW_TYPE.equalsIgnoreCase(glueTable.tableType())
+        || glueTable.parameters() == null) {
+      return false;
+    }
+
+    // table_type wins. An Iceberg view's own properties reach the Glue parameters, so one created
+    // with presto_view=true set by hand would otherwise be sent to the base64 parser and fail to
+    // load. There is exactly one authoritative marker for an Iceberg view, and this is not it.
+    if (GlueCatalog.ICEBERG_VIEW_TYPE_VALUE.equalsIgnoreCase(
+        glueTable.parameters().get(BaseMetastoreTableOperations.TABLE_TYPE_PROP))) {
+      return false;
+    }
+
+    return "true".equalsIgnoreCase(glueTable.parameters().get(PRESTO_VIEW_PARAM));
   }
 
   /** Builds the read-only {@link ViewOperations} a {@code BaseView} needs for a Presto view. */
@@ -296,8 +308,13 @@ class PrestoViews {
         i = readQuotedIdentifier(sql, i, identifier);
         String name = identifier.toString();
 
-        // Skip "catalog". - keep the database and table, which the engine can resolve.
-        if (name.equals(catalog) && i < sql.length() && sql.charAt(i) == '.') {
+        // Skip "catalog". - keep the database and table, which the engine can resolve. Only in the
+        // three-part shape Trino writes for a relation: an alias or field that happens to carry the
+        // catalog's name is two-part, and dropping its qualifier would resolve something else.
+        if (name.equals(catalog)
+            && i < sql.length()
+            && sql.charAt(i) == '.'
+            && qualifiesRelation(sql, i)) {
           i++;
           continue;
         }
@@ -318,9 +335,11 @@ class PrestoViews {
    * what it takes from it.
    */
   @VisibleForTesting
-  static boolean hasProjectionStar(String sql) {
+  static boolean hasProjectionStar(String rawSql) {
+    String sql = stripWrappingParens(rawSql);
     int depth = 0;
     boolean inProjection = false;
+    boolean foundProjection = false;
     int i = 0;
 
     while (i < sql.length()) {
@@ -344,9 +363,10 @@ class PrestoViews {
         return true;
       } else if (depth == 0 && keywordAt(sql, i, "select")) {
         inProjection = true;
+        foundProjection = true;
         i += "select".length();
         continue;
-      } else if (depth == 0 && keywordAt(sql, i, "from")) {
+      } else if (depth == 0 && inProjection && keywordAt(sql, i, "from")) {
         // Only the outermost projection matters, and it ends at its own FROM.
         return false;
       }
@@ -354,7 +374,96 @@ class PrestoViews {
       i++;
     }
 
+    // No SELECT list was found at depth zero, so this walk could not see the outer projection at
+    // all - a root query nested in some shape stripWrappingParens does not undo. Refusing is the
+    // only safe answer: the alternative is serving a star projection off a possibly stale schema.
+    return !foundProjection;
+  }
+
+  /**
+   * Unwraps a root query written as {@code (SELECT ...)}, which would otherwise scan at depth one.
+   */
+  private static String stripWrappingParens(String sql) {
+    String query = sql.trim();
+    while (query.startsWith("(") && closesAtEnd(query)) {
+      query = query.substring(1, query.length() - 1).trim();
+    }
+
+    return query;
+  }
+
+  /** True when the parenthesis opening {@code sql} is closed by its very last character. */
+  private static boolean closesAtEnd(String sql) {
+    int depth = 0;
+    int i = 0;
+
+    while (i < sql.length()) {
+      int nonCode = endOfNonCode(sql, i);
+      if (nonCode >= 0) {
+        i = nonCode;
+        continue;
+      }
+
+      int identifierEnd = endOfQuotedIdentifier(sql, i);
+      if (identifierEnd > 0) {
+        i = identifierEnd;
+        continue;
+      }
+
+      char c = sql.charAt(i);
+      if (c == '(') {
+        depth++;
+      } else if (c == ')') {
+        depth--;
+        if (depth == 0) {
+          return i == sql.length() - 1;
+        }
+      }
+
+      i++;
+    }
+
     return false;
+  }
+
+  /**
+   * True when {@code ."ident"."ident"} follows the dot at {@code dot} - the three-part shape Trino
+   * writes for a relation reference.
+   */
+  private static boolean qualifiesRelation(String sql, int dot) {
+    int afterDatabase = endOfQuotedIdentifier(sql, dot + 1);
+    if (afterDatabase < 0 || afterDatabase >= sql.length() || sql.charAt(afterDatabase) != '.') {
+      return false;
+    }
+
+    return endOfQuotedIdentifier(sql, afterDatabase + 1) > 0;
+  }
+
+  /**
+   * Returns the index just past the quoted identifier starting at {@code i}, or -1 when none starts
+   * there or it is unterminated. Unlike {@link #readQuotedIdentifier} this never throws: it is used
+   * to look ahead, where not matching is an ordinary answer.
+   */
+  private static int endOfQuotedIdentifier(String sql, int i) {
+    if (i >= sql.length() || sql.charAt(i) != '"') {
+      return -1;
+    }
+
+    int j = i + 1;
+    while (j < sql.length()) {
+      if (sql.charAt(j) == '"') {
+        if (next(sql, j) == '"') {
+          j += 2;
+          continue;
+        }
+
+        return j + 1;
+      }
+
+      j++;
+    }
+
+    return -1;
   }
 
   private static boolean keywordAt(String sql, int i, String keyword) {
