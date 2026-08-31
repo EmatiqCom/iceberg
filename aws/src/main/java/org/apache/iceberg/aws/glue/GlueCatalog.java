@@ -59,8 +59,11 @@ import org.apache.iceberg.util.LocationUtil;
 import org.apache.iceberg.util.LockManagers;
 import org.apache.iceberg.util.PropertyUtil;
 import org.apache.iceberg.view.BaseMetastoreViewCatalog;
+import org.apache.iceberg.view.BaseView;
+import org.apache.iceberg.view.View;
 import org.apache.iceberg.view.ViewBuilder;
 import org.apache.iceberg.view.ViewOperations;
+import org.apache.iceberg.view.ViewUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import software.amazon.awssdk.services.glue.GlueClient;
@@ -484,6 +487,41 @@ public class GlueCatalog extends BaseMetastoreViewCatalog
     }
   }
 
+  /**
+   * Loads Presto/Athena views ({@code presto_view=true}) read-only, and everything else through the
+   * regular Iceberg view path. See {@link PrestoViews}.
+   */
+  @Override
+  public View loadView(TableIdentifier identifier) {
+    Table glueTable = glueTableOrNull(identifier);
+    if (PrestoViews.isPrestoView(glueTable)) {
+      return new BaseView(
+          PrestoViews.viewOps(glueTable, identifier), ViewUtil.fullViewName(name(), identifier));
+    }
+
+    return super.loadView(identifier);
+  }
+
+  /** Returns the Glue table behind an identifier, or null when there is none. */
+  private Table glueTableOrNull(TableIdentifier identifier) {
+    try {
+      GetTableResponse response =
+          glue.getTable(
+              GetTableRequest.builder()
+                  .catalogId(awsProperties.glueCatalogId())
+                  .databaseName(
+                      IcebergToGlueConverter.getDatabaseName(
+                          identifier, awsProperties.glueCatalogSkipNameValidation()))
+                  .name(
+                      IcebergToGlueConverter.getTableName(
+                          identifier, awsProperties.glueCatalogSkipNameValidation()))
+                  .build());
+      return response.table();
+    } catch (EntityNotFoundException e) {
+      return null;
+    }
+  }
+
   @Override
   protected ViewOperations newViewOps(TableIdentifier viewIdentifier) {
     Map<String, String> effectiveProperties =
@@ -527,6 +565,15 @@ public class GlueCatalog extends BaseMetastoreViewCatalog
       Table glueTable = response.table();
 
       if (!isGlueIcebergView(glueTable)) {
+        // listViews and viewExists report Presto/Athena views, so a drop can legitimately land on
+        // one. Returning false would read as "there was no such view" and hide why nothing
+        // happened.
+        ValidationException.check(
+            !PrestoViews.isPrestoView(glueTable),
+            "Cannot drop view %s: it is a Presto/Athena view, which Iceberg only reads. Drop it in "
+                + "the engine that owns it.",
+            identifier);
+
         LOG.warn("dropView({}) called but Glue table is not an iceberg-view", identifier);
         return false;
       }
@@ -572,7 +619,7 @@ public class GlueCatalog extends BaseMetastoreViewCatalog
 
         if (response.hasTableList()) {
           for (Table t : response.tableList()) {
-            if (isGlueIcebergView(t)) {
+            if (isGlueIcebergView(t) || PrestoViews.isPrestoView(t)) {
               TableIdentifier tid = GlueToIcebergConverter.toTableId(t);
               results.add(tid);
             }
@@ -720,11 +767,7 @@ public class GlueCatalog extends BaseMetastoreViewCatalog
                   .build());
       Table glueTable = response.table();
 
-      return glueTable != null
-          && GLUE_VIRTUAL_VIEW_TYPE.equalsIgnoreCase(glueTable.tableType())
-          && glueTable.parameters() != null
-          && ICEBERG_VIEW_TYPE_VALUE.equalsIgnoreCase(
-              glueTable.parameters().get(BaseMetastoreTableOperations.TABLE_TYPE_PROP));
+      return isGlueIcebergView(glueTable) || PrestoViews.isPrestoView(glueTable);
 
     } catch (EntityNotFoundException e) {
       return false;

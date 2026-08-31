@@ -118,6 +118,16 @@ public class GlueViewOperations extends BaseViewOperations implements AutoClosea
       String tableType = table.parameters().get(BaseMetastoreTableOperations.TABLE_TYPE_PROP);
 
       if (tableType == null) {
+        // GlueCatalog.loadView serves Presto/Athena views itself, so reaching here with one means a
+        // create, replace or drop is trying to take over its name. Say that, rather than claiming
+        // the view does not exist.
+        ValidationException.check(
+            !PrestoViews.isPrestoView(table),
+            "Cannot write view %s.%s: the name holds a Presto/Athena view, which Iceberg only "
+                + "reads. Drop it in the engine that owns it, or pick another name.",
+            databaseName,
+            viewName);
+
         throw new NoSuchViewException("Iceberg View does not exist: %s.%s", databaseName, viewName);
       }
 
@@ -237,6 +247,15 @@ public class GlueViewOperations extends BaseViewOperations implements AutoClosea
    */
   private void validateGlueTableState(Table glueTable, ViewMetadata base) {
     if (glueTable != null) {
+      // Before anything else, and independent of base: the branch below lets a non-Iceberg
+      // VIRTUAL_VIEW through whenever base is non-null, so an owning engine that replaced this name
+      // with a Presto view after we loaded our base would have its view overwritten here.
+      ValidationException.check(
+          !PrestoViews.isPrestoView(glueTable),
+          "Cannot write view %s.%s: the name holds a Presto/Athena view, which Iceberg only reads",
+          databaseName,
+          viewName);
+
       String tableType = glueTable.parameters().get(BaseMetastoreTableOperations.TABLE_TYPE_PROP);
       String glueTableType = glueTable.tableType();
 
